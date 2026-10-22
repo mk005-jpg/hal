@@ -1,0 +1,21 @@
+# Build outputs
+app/build/
+native/*/build/
+build/
+.gradle/
+
+# IDE
+.idea/
+*.iml
+
+# Local secrets
+local.properties
+keystore.*
+*.jks
+
+# Temp / OS
+*.DS_Store
+Thumbs.db
+
+# Frida server binary (too large for git)
+frida/frida-server*
