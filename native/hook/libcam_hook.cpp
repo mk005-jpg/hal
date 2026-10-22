@@ -215,8 +215,11 @@ static int hook_return_buffer(void *thiz, const cam_stream_buf *buf,
         bool is_blob = (s->format == 33);        // HAL_PIXEL_FORMAT_BLOB (still JPEG)
         bool big     = (s->width >= 1280 || is_blob);
 
-        // Skip streams that look like front-camera selfie previews
-        // (small YUV frames; BLOB is always a still capture → always replace)
+        // NOTE: this gates on stream size/format only — it does NOT distinguish
+        // front from back.  A >=1280-wide front selfie preview is also replaced.
+        // A true back-only gate needs the stream's physical_camera_id (struct
+        // offset to be confirmed on-device) or a BPF-confirmed node mapping;
+        // tracked as a follow-up.  BLOB is always a still capture → replace.
         if (big) {
             int dmabuf_fd = (*buf->buffer)->data[0];
             size_t hint   = is_blob
