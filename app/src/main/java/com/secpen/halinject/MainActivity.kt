@@ -206,7 +206,7 @@ class MainActivity : AppCompatActivity() {
             tvStatus.setTextColor(Color.RED)
             return
         }
-        tvStatus.text = "Daemon: connected | Frida PID ${s.fridaPid}"
+        tvStatus.text = "Daemon: connected | hook ${if (s.hookLoaded) "loaded" else "not loaded"}"
         tvStatus.setTextColor(if (s.active) Color.parseColor("#00c853") else Color.YELLOW)
         if (s.backNode.isNotEmpty()) tvNode.text = "Back cam: ${s.backNode}"
         if (s.active && !injecting) {
@@ -228,11 +228,12 @@ class MainActivity : AppCompatActivity() {
                 val f = File("/data/local/tmp/hal_inject/stats.json")
                 if (f.exists()) {
                     val json = org.json.JSONObject(f.readText())
-                    val inj  = json.optInt("injected", 0)
-                    val skip = json.optInt("skipped", 0)
-                    val err  = json.optInt("errors", 0)
+                    // libcam_hook.so writes {"frames":N,"active":bool}
+                    val frames = json.optLong("frames", 0)
+                    val active = json.optBoolean("active", false)
                     handler.post {
-                        tvStats.text = "Injected: $inj  |  Skipped: $skip  |  Errors: $err"
+                        tvStats.text = "Frames injected: $frames" +
+                            if (active) "  |  active" else ""
                     }
                 }
             } catch (_: Exception) {}

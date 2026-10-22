@@ -57,14 +57,17 @@
 #define CAM_HOOK_SO  "/data/local/tmp/hal_inject/libcam_hook.so"
 #define FRAMEPLACE   "/data/local/tmp/hal_inject/frameplace"
 #define STAGE_IMAGE  "/data/local/tmp/hal_inject/source.img"
+#define GEOM_FILE    "/data/local/tmp/hal_inject/geom.json"
 #define INJECT_DIR   "/data/local/tmp/hal_inject"
 
 static std::atomic<bool>  g_inject_active{false};
 static std::atomic<bool>  g_hook_loaded{false};
+static std::atomic<bool>  g_fallback_running{false};
 static std::string        g_image_path;
 static std::string        g_fit = "cover";
 static std::string        g_back_node;
 static std::mutex         g_mu;
+static std::mutex         g_injector_mu;   // serialises ptrace injection
 
 // ─── ctrl file ────────────────────────────────────────────────────────────
 
@@ -100,6 +103,9 @@ static pid_t find_pid(const char *name) {
 // ─── PRIMARY: ptrace injection of libcam_hook.so ──────────────────────────
 
 static bool run_injector() {
+    // Serialise: START and the BPF camera-open handler can both call this, and
+    // two concurrent PTRACE_ATTACH on cameraserver would make one fail.
+    std::lock_guard<std::mutex> lk(g_injector_mu);
     // cam_injector cameraserver /data/local/tmp/hal_inject/libcam_hook.so
     pid_t p = fork();
     if (p == 0) {
@@ -122,10 +128,13 @@ static void fallback_mem_writer_loop() {
     while (g_inject_active.load()) {
         pid_t cam_pid = find_pid("cameraserver");
         if (cam_pid > 0 && !g_back_node.empty()) {
-            inject_frame_via_proc_mem(cam_pid, g_back_node, FRAME_JPEG);
+            // V4L2 MMAP buffers hold raw frames, so feed the NV21 — writing the
+            // JPEG here would drop compressed bytes into a raw YUV region.
+            inject_frame_via_proc_mem(cam_pid, g_back_node, FRAME_NV21);
         }
         usleep(30000); // 30 ms ≈ 33 fps
     }
+    g_fallback_running.store(false);
 }
 
 // ─── Frame placement (frameplace tool) ─────────────────────────────────────
@@ -183,6 +192,26 @@ static bool run_frameplace(const std::string &fit) {
     return ok;
 }
 
+// The hook publishes the real stream geometry to geom.json only once frames
+// start flowing — i.e. after START, which is after SET_IMAGE placed the frame
+// at the default geometry.  START unlinks geom.json and launches this; when the
+// hook writes a fresh one we re-place the staged image at the true geometry.
+static void replace_on_geom_ready() {
+    for (int i = 0; i < 40 && g_inject_active.load(); i++) {   // up to ~4 s
+        struct stat stx;
+        if (stat(GEOM_FILE, &stx) == 0 && stx.st_size > 0) {
+            std::string fit;
+            { std::lock_guard<std::mutex> lk(g_mu); fit = g_fit; }
+            if (access(STAGE_IMAGE, R_OK) == 0) {
+                fprintf(stderr, "[daemon] geom.json ready — re-placing at true geometry\n");
+                run_frameplace(fit);
+            }
+            return;
+        }
+        usleep(100000); // 100 ms
+    }
+}
+
 // ─── Socket command handler ───────────────────────────────────────────────
 
 static void handle_client(int cfd) {
@@ -228,10 +257,17 @@ static void handle_client(int cfd) {
     } else if (cmd == "START") {
         write_ctrl("on");
         g_inject_active.store(true);
+        // Force the hook to re-publish geometry for this session so the
+        // reconcile below places the frame at the true stream dimensions.
+        unlink(GEOM_FILE);
         // Try ptrace injection; if it fails, the fallback loop still runs
         run_injector();
-        // Start fallback /proc/mem writer thread
-        std::thread(fallback_mem_writer_loop).detach();
+        // Start the fallback /proc/mem writer thread once (guard against
+        // duplicate threads if START is sent repeatedly without STOP).
+        if (!g_fallback_running.exchange(true))
+            std::thread(fallback_mem_writer_loop).detach();
+        // Re-place at the real geometry as soon as the hook reports it.
+        std::thread(replace_on_geom_ready).detach();
         resp = "OK\n";
 
     } else if (cmd == "STOP") {
@@ -275,13 +311,23 @@ static void handle_client(int cfd) {
 // ─── BPF event handler ────────────────────────────────────────────────────
 
 static void bpf_event_handler(const CamEvent &ev) {
-    if (ev.ev_type == EV_OPEN && ev.is_back_cam) {
-        fprintf(stderr, "[bpf] back cam opened pid=%u fd=%d (%s)\n",
+    // NOTE: ev.is_back_cam is unreliable — the BPF QUERYCAP front/back parse is
+    // a stub that always reports 0, so gating on it (as the original code did)
+    // meant re-injection never fired.  Re-inject on ANY /dev/video* open while
+    // active instead; the hook self-gates by stream geometry.  A cooldown stops
+    // repeated attaches when several processes open camera nodes at once.
+    if (ev.ev_type == EV_OPEN) {
+        if (!g_inject_active.load()) return;
+        static std::atomic<uint64_t> last_ns{0};
+        uint64_t now  = ev.ts_ns;
+        uint64_t prev = last_ns.load();
+        if (prev != 0 && now - prev < 1000000000ULL) return;  // 1 s cooldown
+        last_ns.store(now);
+        fprintf(stderr, "[bpf] camera opened pid=%u fd=%d (%s) — re-injecting\n",
                 ev.pid, ev.fd, ev.comm);
-        // Re-inject on each camera open in case cameraserver restarted
-        if (g_inject_active.load()) run_injector();
-    } else if (ev.ev_type == EV_CLOSE && ev.is_back_cam) {
-        fprintf(stderr, "[bpf] back cam closed pid=%u fd=%d\n", ev.pid, ev.fd);
+        run_injector();
+    } else if (ev.ev_type == EV_CLOSE) {
+        fprintf(stderr, "[bpf] camera closed pid=%u fd=%d\n", ev.pid, ev.fd);
     }
 }
 

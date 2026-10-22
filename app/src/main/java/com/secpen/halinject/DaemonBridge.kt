@@ -11,12 +11,12 @@ private const val TAG = "DaemonBridge"
 private const val SOCK = "/data/local/tmp/hal_inject/daemon.sock"
 
 data class DaemonStatus(
-    val connected: Boolean = false,
-    val active: Boolean    = false,
-    val fridaPid: Int      = -1,
-    val backNode: String   = "",
-    val imagePath: String  = "",
-    val fit: String        = "cover"
+    val connected: Boolean  = false,
+    val active: Boolean     = false,
+    val hookLoaded: Boolean = false,
+    val backNode: String    = "",
+    val imagePath: String   = "",
+    val fit: String         = "cover"
 )
 
 class DaemonBridge {
@@ -59,7 +59,7 @@ class DaemonBridge {
             DaemonStatus(
                 connected  = true,
                 active     = json.optBoolean("active", false),
-                fridaPid   = json.optInt("frida_pid", -1),
+                hookLoaded = json.optBoolean("hook_loaded", false),
                 backNode   = json.optString("back_node", ""),
                 imagePath  = json.optString("image", ""),
                 fit        = json.optString("fit", "cover")

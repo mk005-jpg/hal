@@ -13,6 +13,7 @@
 
 #include <fcntl.h>
 #include <unistd.h>
+#include <poll.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
 #include <stdio.h>
@@ -69,13 +70,30 @@ static uint64_t g_inject_count = 0;
 
 // ─── Helpers ──────────────────────────────────────────────────────────────
 
-static bool inject_enabled() {
+// Gate state, cached so we don't open()/read()/close() the ctrl file on every
+// returned buffer (that ran inside cameraserver at frame rate × stream count).
+// Re-read at most every CTRL_REFRESH calls; worst-case lag to a START/STOP is
+// a fraction of a second, which is fine for arming/disarming.
+#define CTRL_REFRESH 15
+
+static bool read_ctrl_file() {
     char buf[8] = {};
     int fd = open(CTRL_FILE, O_RDONLY);
     if (fd < 0) return false;
     ssize_t r = read(fd, buf, 4);
     close(fd);
     return r >= 2 && buf[0] == 'o' && buf[1] == 'n';
+}
+
+static bool inject_enabled() {
+    static bool     cached   = false;
+    static uint32_t countdown = 0;
+    if (countdown == 0) {
+        cached    = read_ctrl_file();
+        countdown = CTRL_REFRESH;
+    }
+    --countdown;
+    return cached;
 }
 
 static void bump_stats() {
@@ -106,9 +124,25 @@ static void publish_geom(const stream_t *s) {
     if (fd >= 0) { write(fd, tmp, strlen(tmp)); close(fd); }
 }
 
-// Write frame file into a dmabuf fd.
-// blob_format=true → JPEG payload written to a BLOB stream.
-static void replace_dmabuf(int dmabuf_fd, size_t buf_cap, bool blob_fmt) {
+// camera3_jpeg_blob — trailer the consumer reads to learn the JPEG size.
+// Layout must match hardware/libhardware camera3.h (NOT packed: 2 + 2 pad + 4).
+struct camera3_jpeg_blob { uint16_t jpeg_blob_id; uint32_t jpeg_size; };
+#define CAMERA3_JPEG_BLOB_ID 0x00FF
+
+// Wait for the buffer producer (ISP/GPU) to finish writing before we overwrite
+// it.  acquire_fence < 0 means "already ready".  A sync fence fd becomes
+// readable once signalled, so a bounded poll() is a dependency-free wait.
+static void wait_acquire_fence(int fence_fd) {
+    if (fence_fd < 0) return;
+    struct pollfd pfd = { fence_fd, POLLIN, 0 };
+    poll(&pfd, 1, 200 /* ms cap */);   // don't close: the framework owns it
+}
+
+// Write the frame file into a dmabuf fd.
+// blob_fmt=true → JPEG payload written to a BLOB stream (plus the size trailer).
+// size_hint is the caller's geometry-derived estimate, used only if the kernel
+// can't report the real dmabuf size.
+static void replace_dmabuf(int dmabuf_fd, size_t size_hint, bool blob_fmt) {
     const char *src = blob_fmt ? FRAME_JPEG : FRAME_NV21;
     int sfd = open(src, O_RDONLY);
     if (sfd < 0) {
@@ -125,11 +159,32 @@ static void replace_dmabuf(int dmabuf_fd, size_t buf_cap, bool blob_fmt) {
     close(sfd);
     if (src_data == MAP_FAILED) return;
 
-    void *dst = mmap(NULL, buf_cap, PROT_WRITE, MAP_SHARED, dmabuf_fd, 0);
+    // dma-buf implements llseek(SEEK_END) to report its true allocated size.
+    // Prefer that over the geometry estimate, which over-counts BLOB (1-D)
+    // buffers and ignores stride padding on YUV buffers.
+    off_t real = lseek(dmabuf_fd, 0, SEEK_END);
+    size_t cap = (real > 0) ? (size_t)real : size_hint;
+
+    void *dst = mmap(NULL, cap, PROT_READ | PROT_WRITE, MAP_SHARED, dmabuf_fd, 0);
     if (dst != MAP_FAILED) {
-        size_t n = (size_t)st.st_size < buf_cap ? (size_t)st.st_size : buf_cap;
-        memcpy(dst, src_data, n);
-        munmap(dst, buf_cap);
+        size_t payload = (size_t)st.st_size;
+        if (blob_fmt) {
+            // Leave room for the trailer and write it so the consumer finds the
+            // correct JPEG size instead of scanning garbage.
+            size_t room = cap > sizeof(camera3_jpeg_blob)
+                        ? cap - sizeof(camera3_jpeg_blob) : 0;
+            if (payload > room) payload = room;
+            memcpy(dst, src_data, payload);
+            if (room) {
+                auto *blob = (camera3_jpeg_blob *)((uint8_t *)dst + room);
+                blob->jpeg_blob_id = CAMERA3_JPEG_BLOB_ID;
+                blob->jpeg_size    = (uint32_t)payload;
+            }
+        } else {
+            if (payload > cap) payload = cap;
+            memcpy(dst, src_data, payload);
+        }
+        munmap(dst, cap);
     }
     munmap(src_data, (size_t)st.st_size);
 }
@@ -157,21 +212,23 @@ static int hook_return_buffer(void *thiz, const cam_stream_buf *buf,
         (*buf->buffer)->numFds > 0) {
 
         stream_t *s = buf->stream;
-        bool is_blob = (s->format == 33);                    // HAL_PIXEL_FORMAT_BLOB
-        bool is_yuv  = (s->format == 35 || s->format == 17  // YCbCr_420_888 / YCrCb_420_SP
-                        || s->format == 842094169);          // YV12
+        bool is_blob = (s->format == 33);        // HAL_PIXEL_FORMAT_BLOB (still JPEG)
         bool big     = (s->width >= 1280 || is_blob);
 
         // Skip streams that look like front-camera selfie previews
         // (small YUV frames; BLOB is always a still capture → always replace)
         if (big) {
             int dmabuf_fd = (*buf->buffer)->data[0];
-            size_t cap    = is_blob
-                          ? (size_t)s->width * s->height      // BLOB: 1 byte/px upper bound
+            size_t hint   = is_blob
+                          ? (size_t)s->width * s->height          // 1-D blob estimate
                           : (size_t)s->width * s->height * 3 / 2; // YUV NV21/NV12
 
+            // Only overwrite once the producer has finished filling the buffer,
+            // otherwise the hardware DMA races (and usually wins over) our write.
+            wait_acquire_fence(buf->acquire_fence);
+
             publish_geom(s);
-            replace_dmabuf(dmabuf_fd, cap, is_blob);
+            replace_dmabuf(dmabuf_fd, hint, is_blob);
             bump_stats();
         }
     }
@@ -181,9 +238,31 @@ static int hook_return_buffer(void *thiz, const cam_stream_buf *buf,
 }
 
 // ─── ELF symbol finder (reads lib from disk, tolerates stripped section hdrs) ─
+//
+// "returnBuffer" is a substring of several mangled symbols —
+// Camera3Stream::returnBuffer, *::returnBufferLocked, and overloads in other
+// classes.  Only Camera3Stream::returnBuffer has the 8-argument ABI we call
+// through, so first-substring-wins is a bug: it can bind returnBufferLocked
+// (a different, virtual signature) and corrupt the register arguments.  We
+// score every candidate and keep the best instead of taking the first hit.
+//
+//   +4  name contains the exact mangled component "12returnBuffer" (required)
+//   -5  name contains "Locked"         → returnBufferLocked, wrong ABI
+//   +2  name contains "Camera3Stream"  → the public entry point we want
+//
+// The winner must out-score the 3-point gate, i.e. it must carry the exact
+// "12returnBuffer" component; a "...returnBufferLocked..." symbol nets -1 and
+// can never be chosen.
+static int score_return_buffer(const char *name) {
+    if (!strstr(name, "returnBuffer")) return -1000;   // not a candidate
+    int score = 0;
+    if (strstr(name, "12returnBuffer")) score += 4;    // exact mangled component
+    if (strstr(name, "Locked"))         score -= 5;    // returnBufferLocked
+    if (strstr(name, "Camera3Stream"))  score += 2;    // public entry point
+    return score;
+}
 
-static bool find_func_by_substr(const char *lib_name, const char *needle,
-                                 void **out_fn) {
+static bool find_return_buffer(const char *lib_name, void **out_fn) {
     // 1. Find load base in /proc/self/maps
     FILE *mf = fopen("/proc/self/maps", "r");
     if (!mf) return false;
@@ -231,6 +310,26 @@ static bool find_func_by_substr(const char *lib_name, const char *needle,
             if (phdrs[i].p_type == PT_LOAD) { elf_vbase = phdrs[i].p_vaddr; break; }
         }
 
+        // Best candidate seen so far.  Gate at 3 so only a symbol carrying the
+        // exact "12returnBuffer" component (score >= 4) can win.
+        int       best_score = 3;
+        uintptr_t best_addr  = 0;
+
+        auto scan = [&](const Elf64_Sym *symtab, size_t count, const char *strtab) {
+            if (!symtab || !strtab) return;
+            for (size_t i = 0; i < count; i++) {
+                if (ELF64_ST_TYPE(symtab[i].st_info) != STT_FUNC) continue;
+                if (symtab[i].st_value == 0) continue;
+                const char *sname = strtab + symtab[i].st_name;
+                int s = score_return_buffer(sname);
+                if (s > best_score) {
+                    best_score = s;
+                    best_addr  = lib_base - elf_vbase + symtab[i].st_value;
+                    LOGD("candidate %s score=%d", sname, s);
+                }
+            }
+        };
+
         // Find .dynsym / .dynstr via section headers (present on system libs)
         if (ehdr->e_shoff != 0 && ehdr->e_shnum > 0) {
             auto *shdrs = (Elf64_Shdr *)((uint8_t *)elf_data + ehdr->e_shoff);
@@ -254,26 +353,12 @@ static bool find_func_by_substr(const char *lib_name, const char *needle,
                     strtab = (const char *)((uint8_t *)elf_data + shdrs[i].sh_offset);
                 }
             }
-
-            if (symtab && strtab) {
-                for (size_t i = 0; i < sym_count; i++) {
-                    if (ELF64_ST_TYPE(symtab[i].st_info) != STT_FUNC) continue;
-                    if (symtab[i].st_value == 0) continue;
-                    const char *sname = strtab + symtab[i].st_name;
-                    if (strstr(sname, needle)) {
-                        uintptr_t va = symtab[i].st_value;
-                        *out_fn = (void *)(lib_base - elf_vbase + va);
-                        LOGD("found [section] %s at %p", sname, *out_fn);
-                        found = true;
-                        break;
-                    }
-                }
-            }
+            scan(symtab, sym_count, strtab);
         }
 
         // Fallback: use DT_HASH + DT_SYMTAB in PT_DYNAMIC (no section headers needed)
-        if (!found) {
-            for (int i = 0; i < ehdr->e_phnum && !found; i++) {
+        if (!best_addr) {
+            for (int i = 0; i < ehdr->e_phnum; i++) {
                 if (phdrs[i].p_type != PT_DYNAMIC) continue;
                 auto *dyn = (Elf64_Dyn *)((uint8_t *)elf_data + phdrs[i].p_offset);
 
@@ -295,20 +380,16 @@ static bool find_func_by_substr(const char *lib_name, const char *needle,
                     dyn++;
                 }
 
-                if (!symtab || !strtab || !hash_tbl) break;
-                uint32_t nchain = hash_tbl[1];
-
-                for (uint32_t j = 0; j < nchain && !found; j++) {
-                    if (ELF64_ST_TYPE(symtab[j].st_info) != STT_FUNC) continue;
-                    if (symtab[j].st_value == 0) continue;
-                    const char *sname = strtab + symtab[j].st_name;
-                    if (strstr(sname, needle)) {
-                        *out_fn = (void *)(lib_base - elf_vbase + symtab[j].st_value);
-                        LOGD("found [dynamic] %s at %p", sname, *out_fn);
-                        found = true;
-                    }
-                }
+                if (symtab && strtab && hash_tbl)
+                    scan(symtab, hash_tbl[1] /* nchain */, strtab);
+                break;
             }
+        }
+
+        if (best_addr) {
+            *out_fn = (void *)best_addr;
+            LOGD("returnBuffer resolved to %p (score=%d)", *out_fn, best_score);
+            found = true;
         }
     }
 
@@ -320,21 +401,14 @@ done:
 // ─── Constructor ──────────────────────────────────────────────────────────
 
 __attribute__((constructor)) static void cam_hook_init() {
-    LOGD("cam_hook_init: searching returnBuffer in libcameraservice.so");
+    LOGD("cam_hook_init: resolving Camera3Stream::returnBuffer in libcameraservice.so");
 
     void *target = nullptr;
-
-    // Symbol fragment unique within libcameraservice.so:
-    // The mangled name contains "Camera3OutputStream" and "returnBuffer"
-    // e.g. _ZN7android18Camera3OutputStreamR12returnBufferERK...
-    // We match on "Camera3Output" + "returnBuffer" in two passes.
-    bool ok = find_func_by_substr("libcameraservice", "returnBuffer", &target);
-    if (!ok || !target) {
-        // Some AOSP builds mangle differently; try shorter fragment
-        ok = find_func_by_substr("libcameraservice", "12returnBuffer", &target);
-    }
-    if (!ok || !target) {
-        LOGW("cam_hook_init: returnBuffer not found — hook inactive");
+    if (!find_return_buffer("libcameraservice", &target) || !target) {
+        // If this fires, returnBuffer is almost certainly a non-exported
+        // (local, stripped) symbol on this build — the hook cannot bind by
+        // symbol name and a pattern/vtable-based resolver would be needed.
+        LOGW("cam_hook_init: returnBuffer not found in .dynsym — hook inactive");
         return;
     }
 
