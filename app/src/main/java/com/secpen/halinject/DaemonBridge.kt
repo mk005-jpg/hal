@@ -15,7 +15,8 @@ data class DaemonStatus(
     val active: Boolean    = false,
     val fridaPid: Int      = -1,
     val backNode: String   = "",
-    val imagePath: String  = ""
+    val imagePath: String  = "",
+    val fit: String        = "cover"
 )
 
 class DaemonBridge {
@@ -41,6 +42,9 @@ class DaemonBridge {
 
     fun setImage(path: String): Boolean = send("SET_IMAGE $path").startsWith("OK")
 
+    /** Re-place the staged image with a new fit mode: cover|contain|stretch. */
+    fun place(fit: String): Boolean = send("PLACE $fit").startsWith("OK")
+
     fun start(): Boolean = send("START").startsWith("OK")
 
     fun stop(): Boolean = send("STOP").startsWith("OK")
@@ -57,7 +61,8 @@ class DaemonBridge {
                 active     = json.optBoolean("active", false),
                 fridaPid   = json.optInt("frida_pid", -1),
                 backNode   = json.optString("back_node", ""),
-                imagePath  = json.optString("image", "")
+                imagePath  = json.optString("image", ""),
+                fit        = json.optString("fit", "cover")
             )
         } catch (e: Exception) {
             DaemonStatus(connected = false)

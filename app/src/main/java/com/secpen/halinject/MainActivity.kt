@@ -28,6 +28,7 @@ private val TARGETS = listOf(
 )
 
 private const val REQ_IMAGE = 1001
+private const val REQ_REF   = 1002
 
 class MainActivity : AppCompatActivity() {
 
@@ -38,14 +39,18 @@ class MainActivity : AppCompatActivity() {
     private lateinit var tvStatus:    TextView
     private lateinit var tvNode:      TextView
     private lateinit var ivPreview:   ImageView
+    private lateinit var ivReference: ImageView
     private lateinit var tvImagePath: TextView
     private lateinit var btnPick:     Button
+    private lateinit var btnPickRef:  Button
     private lateinit var btnToggle:   Button
     private lateinit var llTargets:   LinearLayout
     private lateinit var tvStats:     TextView
 
     private var injecting = false
     private var imagePath: String? = null
+    private var fitMode   = "cover"
+    private val fitButtons = mutableListOf<Button>()
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -68,25 +73,44 @@ class MainActivity : AppCompatActivity() {
     // ── Activity result: image picked ─────────────────────────────────────────
     override fun onActivityResult(req: Int, result: Int, data: Intent?) {
         super.onActivityResult(req, result, data)
-        if (req != REQ_IMAGE || result != Activity.RESULT_OK) return
+        if (result != Activity.RESULT_OK) return
         val uri: Uri = data?.data ?: return
-        toast("Preparing image…")
 
-        Thread {
-            val path = ImagePrep.prepare(this, uri)
-            handler.post {
-                if (path != null) {
-                    imagePath = path
-                    tvImagePath.text = "Image: ${File(path).name}"
-                    val bmp = BitmapFactory.decodeFile(path)
-                    if (bmp != null) ivPreview.setImageBitmap(bmp)
-                    bridge.setImage(path)
-                    toast("Frame ready")
-                } else {
-                    toast("Image preparation failed")
-                }
+        when (req) {
+            REQ_IMAGE -> {
+                toast("Preparing image…")
+                Thread {
+                    val path = ImagePrep.prepare(this, uri)
+                    handler.post {
+                        if (path != null) {
+                            imagePath = path
+                            tvImagePath.text = "Image: ${File(path).name}"
+                            val bmp = BitmapFactory.decodeFile(path)
+                            if (bmp != null) ivPreview.setImageBitmap(bmp)
+                            bridge.setImage(path)
+                            toast("Frame ready")
+                        } else {
+                            toast("Image preparation failed")
+                        }
+                    }
+                }.start()
             }
-        }.start()
+            REQ_REF -> {
+                toast("Loading reference…")
+                Thread {
+                    val bmp = ImagePrep.saveReference(this, uri)
+                    handler.post {
+                        if (bmp != null) {
+                            ivReference.setImageBitmap(bmp)
+                            ivReference.visibility = View.VISIBLE
+                            toast("Reference overlay added")
+                        } else {
+                            toast("Reference load failed")
+                        }
+                    }
+                }.start()
+            }
+        }
     }
 
     // ── UI ────────────────────────────────────────────────────────────────────
@@ -108,16 +132,50 @@ class MainActivity : AppCompatActivity() {
         tvNode   = textView("Back cam node: detecting…", 12f, Color.LTGRAY)
         root.addView(card(tvStatus, tvNode))
 
-        // Image section
+        // Image section — injection frame with an optional placement-reference
+        // screenshot overlaid on top so the operator can line the frame up with
+        // the target app's face/document guide.
         ivPreview   = ImageView(this).apply {
-            layoutParams = LinearLayout.LayoutParams(
-                LinearLayout.LayoutParams.MATCH_PARENT, 220)
-            scaleType = ImageView.ScaleType.CENTER_CROP
+            layoutParams = FrameLayout.LayoutParams(
+                FrameLayout.LayoutParams.MATCH_PARENT,
+                FrameLayout.LayoutParams.MATCH_PARENT)
+            scaleType = ImageView.ScaleType.FIT_CENTER
             setBackgroundColor(Color.parseColor("#2a2a3e"))
         }
+        ivReference = ImageView(this).apply {
+            layoutParams = FrameLayout.LayoutParams(
+                FrameLayout.LayoutParams.MATCH_PARENT,
+                FrameLayout.LayoutParams.MATCH_PARENT)
+            scaleType = ImageView.ScaleType.FIT_CENTER
+            alpha     = 0.5f
+            visibility = View.GONE
+        }
+        val previewStack = FrameLayout(this).apply {
+            layoutParams = LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT, 320)
+            addView(ivPreview)
+            addView(ivReference)
+        }
+
+        // Reference opacity slider (only meaningful once a reference is loaded).
+        val tvRefLabel = textView("Reference overlay opacity", 11f, Color.GRAY)
+        val sbRef = SeekBar(this).apply {
+            max = 100
+            progress = 50
+            setOnSeekBarChangeListener(object : SeekBar.OnSeekBarChangeListener {
+                override fun onProgressChanged(sb: SeekBar?, p: Int, fromUser: Boolean) {
+                    ivReference.alpha = p / 100f
+                }
+                override fun onStartTrackingTouch(sb: SeekBar?) {}
+                override fun onStopTrackingTouch(sb: SeekBar?) {}
+            })
+        }
+
         tvImagePath = textView("No image selected", 12f, Color.LTGRAY)
         btnPick     = button("Pick Injection Frame") { pickImage() }
-        root.addView(card(ivPreview, tvImagePath, btnPick))
+        btnPickRef  = button("Add Placement Reference (screenshot)",
+                             Color.parseColor("#5e35b1")) { pickReference() }
+        root.addView(card(previewStack, tvRefLabel, sbRef, fitRow(), tvImagePath, btnPick, btnPickRef))
 
         // Target apps list
         llTargets = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
@@ -192,12 +250,70 @@ class MainActivity : AppCompatActivity() {
         }.start()
     }
 
-    private fun pickImage() {
+    private fun pickImage() = openImagePicker(REQ_IMAGE)
+
+    private fun pickReference() = openImagePicker(REQ_REF)
+
+    private fun openImagePicker(reqCode: Int) {
         val intent = Intent(Intent.ACTION_OPEN_DOCUMENT).apply {
             addCategory(Intent.CATEGORY_OPENABLE)
             type = "image/*"
         }
-        startActivityForResult(intent, REQ_IMAGE)
+        startActivityForResult(intent, reqCode)
+    }
+
+    // Fit-mode selector — re-places the staged frame to match the stream
+    // geometry. cover fills (crops overflow), contain pads, stretch distorts.
+    private fun fitRow(): LinearLayout {
+        val row = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            layoutParams = LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT,
+                LinearLayout.LayoutParams.WRAP_CONTENT).also { it.setMargins(0, 8, 0, 4) }
+        }
+        fitButtons.clear()
+        listOf("cover", "contain", "stretch").forEach { mode ->
+            val b = Button(this).apply {
+                text = mode
+                textSize = 11f
+                setTextColor(Color.WHITE)
+                layoutParams = LinearLayout.LayoutParams(0,
+                    LinearLayout.LayoutParams.WRAP_CONTENT, 1f)
+                    .also { it.setMargins(4, 0, 4, 0) }
+                setOnClickListener { applyFit(mode) }
+            }
+            fitButtons.add(b)
+            row.addView(b)
+        }
+        highlightFit()
+        return row
+    }
+
+    private fun highlightFit() {
+        fitButtons.forEach { b ->
+            b.setBackgroundColor(
+                if (b.text.toString() == fitMode) Color.parseColor("#3949ab")
+                else Color.parseColor("#2a2a3e"))
+        }
+    }
+
+    private fun applyFit(mode: String) {
+        if (fitMode == mode) return
+        fitMode = mode
+        highlightFit()
+        if (imagePath == null) { toast("Pick an image first"); return }
+        toast("Placing: $mode")
+        Thread {
+            val ok = bridge.place(mode)
+            handler.post {
+                if (ok) {
+                    val bmp = BitmapFactory.decodeFile("/data/local/tmp/hal_inject/frame.jpg")
+                    if (bmp != null) ivPreview.setImageBitmap(bmp)
+                } else {
+                    toast("Placement failed")
+                }
+            }
+        }.start()
     }
 
     private fun ensureDaemon() {

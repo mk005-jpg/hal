@@ -31,6 +31,7 @@
 #define FRAME_JPEG CTRL_DIR "/frame.jpg"
 #define FRAME_NV21 CTRL_DIR "/frame.nv21"
 #define STATS_FILE CTRL_DIR "/stats.json"
+#define GEOM_FILE  CTRL_DIR "/geom.json"
 
 // ─── Android camera stream / buffer structs (AOSP android-13 arm64) ───────
 
@@ -84,6 +85,24 @@ static void bump_stats() {
              "{\"frames\":%llu,\"active\":true}\n",
              (unsigned long long)g_inject_count);
     int fd = open(STATS_FILE, O_WRONLY | O_CREAT | O_TRUNC, 0666);
+    if (fd >= 0) { write(fd, tmp, strlen(tmp)); close(fd); }
+}
+
+// Publish the geometry of the stream we're replacing so the `frameplace` tool
+// can size the injected frame to the exact dimensions the camera uses
+// (`frameplace --geom auto`).  Only written when it changes, to avoid a disk
+// write on every returned buffer.
+static void publish_geom(const stream_t *s) {
+    static uint32_t last_w = 0, last_h = 0;
+    static int      last_f = -1;
+    if (s->width == last_w && s->height == last_h && s->format == last_f) return;
+    last_w = s->width; last_h = s->height; last_f = s->format;
+
+    char tmp[160];
+    snprintf(tmp, sizeof(tmp),
+             "{\"width\":%u,\"height\":%u,\"format\":%d}\n",
+             s->width, s->height, s->format);
+    int fd = open(GEOM_FILE, O_WRONLY | O_CREAT | O_TRUNC, 0666);
     if (fd >= 0) { write(fd, tmp, strlen(tmp)); close(fd); }
 }
 
@@ -151,6 +170,7 @@ static int hook_return_buffer(void *thiz, const cam_stream_buf *buf,
                           ? (size_t)s->width * s->height      // BLOB: 1 byte/px upper bound
                           : (size_t)s->width * s->height * 3 / 2; // YUV NV21/NV12
 
+            publish_geom(s);
             replace_dmabuf(dmabuf_fd, cap, is_blob);
             bump_stats();
         }

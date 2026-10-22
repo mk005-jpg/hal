@@ -11,12 +11,17 @@
 //               buffers directly (uncommon on Pixel 7a but included for coverage).
 //
 // Unix socket protocol (line-based, AF_UNIX /data/local/tmp/hal_inject/daemon.sock):
-//   → SET_IMAGE <path>   copy image, generate NV21
+//   → SET_IMAGE <path>   stage image, place it into the stream geometry
+//   → PLACE <fit>        re-place the staged image with fit cover|contain|stretch
 //   → START              arm injection, (re-)inject libcam_hook.so
 //   → STOP               disarm injection
 //   → STATUS             JSON status line
 //   → BACK_NODE          current back-camera device node
 // Response: "OK\n" | "ERROR <msg>\n" | "STATUS <json>\n"
+//
+// Frame placement is delegated to the `frameplace` tool (native/frameplace),
+// which sizes frame.jpg / frame.nv21 to the exact stream geometry the hook
+// publishes in geom.json and preserves aspect ratio (no more naive stretch).
 
 #include "bpf_loader.h"
 #include "cam_detect.h"
@@ -50,10 +55,14 @@
 #define BPF_OBJ      "/data/local/tmp/hal_inject/cam_track.bpf.o"
 #define CAM_INJECTOR "/data/local/tmp/hal_inject/cam_injector"
 #define CAM_HOOK_SO  "/data/local/tmp/hal_inject/libcam_hook.so"
+#define FRAMEPLACE   "/data/local/tmp/hal_inject/frameplace"
+#define STAGE_IMAGE  "/data/local/tmp/hal_inject/source.img"
+#define INJECT_DIR   "/data/local/tmp/hal_inject"
 
 static std::atomic<bool>  g_inject_active{false};
 static std::atomic<bool>  g_hook_loaded{false};
 static std::string        g_image_path;
+static std::string        g_fit = "cover";
 static std::string        g_back_node;
 static std::mutex         g_mu;
 
@@ -119,6 +128,61 @@ static void fallback_mem_writer_loop() {
     }
 }
 
+// ─── Frame placement (frameplace tool) ─────────────────────────────────────
+
+// Copy src → dst without a shell (avoids metacharacter issues in paths).
+static bool copy_file(const char *src, const char *dst) {
+    int in = open(src, O_RDONLY);
+    if (in < 0) return false;
+    int out = open(dst, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    if (out < 0) { close(in); return false; }
+    char buf[65536];
+    ssize_t n;
+    bool ok = true;
+    while ((n = read(in, buf, sizeof(buf))) > 0) {
+        ssize_t off = 0;
+        while (off < n) {
+            ssize_t w = write(out, buf + off, (size_t)(n - off));
+            if (w <= 0) { ok = false; break; }
+            off += w;
+        }
+        if (!ok) break;
+    }
+    if (n < 0) ok = false;
+    close(in); close(out);
+    return ok;
+}
+
+// Place the staged source image into the current stream geometry via the
+// frameplace tool.  `fit` is cover|contain|stretch.  Falls back to a plain
+// copy (legacy behaviour) if the frameplace binary isn't present.
+static bool run_frameplace(const std::string &fit) {
+    if (access(FRAMEPLACE, X_OK) != 0) {
+        fprintf(stderr, "[daemon] frameplace missing — copying source verbatim\n");
+        bool ok = copy_file(STAGE_IMAGE, FRAME_JPEG);
+        return ok;
+    }
+    pid_t p = fork();
+    if (p == 0) {
+        const char *argv[] = {
+            FRAMEPLACE, STAGE_IMAGE,
+            "--geom", "auto",
+            "--fit",  fit.c_str(),
+            "--out-dir", INJECT_DIR,
+            nullptr
+        };
+        execv(FRAMEPLACE, const_cast<char **>(argv));
+        _exit(127);
+    }
+    if (p < 0) return false;
+    int status;
+    waitpid(p, &status, 0);
+    bool ok = WIFEXITED(status) && WEXITSTATUS(status) == 0;
+    fprintf(stderr, "[daemon] frameplace (fit=%s) %s\n",
+            fit.c_str(), ok ? "ok" : "FAILED");
+    return ok;
+}
+
 // ─── Socket command handler ───────────────────────────────────────────────
 
 static void handle_client(int cfd) {
@@ -133,18 +197,33 @@ static void handle_client(int cfd) {
 
     if (cmd.size() > 10 && cmd.substr(0, 9) == "SET_IMAGE") {
         std::string path = cmd.substr(10);
+        std::string fit;
         {
             std::lock_guard<std::mutex> lk(g_mu);
             g_image_path = path;
+            fit = g_fit;
         }
-        std::string cp = "cp \"" + path + "\" " + FRAME_JPEG + " 2>/dev/null";
-        system(cp.c_str());
-        // Generate NV21 for YUV stream injection
-        std::string ff =
-            "ffmpeg -y -i " FRAME_JPEG
-            " -vf scale=1920:1080 -pix_fmt nv21 " FRAME_NV21
-            " 2>/dev/null";
-        system(ff.c_str());
+        // Stage the source, then place it into the stream geometry with
+        // aspect preserved (frameplace writes frame.jpg + frame.nv21).
+        if (!copy_file(path.c_str(), STAGE_IMAGE)) {
+            resp = "ERROR cannot read image\n";
+        } else if (!run_frameplace(fit)) {
+            resp = "ERROR frame placement failed\n";
+        }
+
+    } else if (cmd.size() >= 5 && cmd.substr(0, 5) == "PLACE") {
+        // PLACE <fit>  — re-place the already-staged source with a new fit mode.
+        std::string fit = (cmd.size() > 6) ? cmd.substr(6) : std::string("cover");
+        if (fit != "cover" && fit != "contain" && fit != "stretch") {
+            resp = "ERROR fit must be cover|contain|stretch\n";
+        } else {
+            { std::lock_guard<std::mutex> lk(g_mu); g_fit = fit; }
+            if (access(STAGE_IMAGE, R_OK) != 0) {
+                resp = "ERROR no staged image — SET_IMAGE first\n";
+            } else if (!run_frameplace(fit)) {
+                resp = "ERROR frame placement failed\n";
+            }
+        }
 
     } else if (cmd == "START") {
         write_ctrl("on");
@@ -170,11 +249,14 @@ static void handle_client(int cfd) {
         for (char *p = sbuf; *p; p++) if (*p == '\n') *p = 0;
 
         std::ostringstream oss;
+        std::string fit_now, img_now;
+        { std::lock_guard<std::mutex> lk(g_mu); fit_now = g_fit; img_now = g_image_path; }
         oss << "STATUS {"
             << "\"active\":"    << (g_inject_active.load() ? "true" : "false") << ","
             << "\"hook_loaded\":" << (g_hook_loaded.load() ? "true" : "false") << ","
             << "\"back_node\":\"" << g_back_node << "\","
-            << "\"image\":\""   << g_image_path << "\","
+            << "\"image\":\""   << img_now << "\","
+            << "\"fit\":\""     << fit_now << "\","
             << "\"stats\":"     << sbuf
             << "}\n";
         resp = oss.str();

@@ -55,7 +55,18 @@ cmake -B native/hook/build \
 cmake --build native/hook/build
 HOOK_SO="native/hook/build/libcam_hook.so"
 
-echo "=== 5. Build eBPF object (Linux/WSL only) ==="
+echo "=== 5. Build frameplace (frame placement tool) ==="
+mkdir -p native/frameplace/build
+cmake -B native/frameplace/build \
+    -DCMAKE_TOOLCHAIN_FILE="${NDK}/build/cmake/android.toolchain.cmake" \
+    -DANDROID_ABI=arm64-v8a \
+    -DANDROID_PLATFORM=android-33 \
+    -DANDROID_STL=c++_static \
+    -S native/frameplace
+cmake --build native/frameplace/build
+FRAMEPLACE_BIN="native/frameplace/build/frameplace"
+
+echo "=== 6. Build eBPF object (Linux/WSL only) ==="
 if command -v clang &>/dev/null && command -v bpftool &>/dev/null; then
     make -C native/bpf
     BPF_OBJ="native/bpf/cam_track.bpf.o"
@@ -64,7 +75,7 @@ else
     BPF_OBJ=""
 fi
 
-echo "=== 6. Push to device ==="
+echo "=== 7. Push to device ==="
 adb shell "su -c 'mkdir -p ${DEVICE_DIR}; chmod 777 ${DEVICE_DIR}'"
 
 # Daemon
@@ -83,6 +94,12 @@ fi
 if [ -f "$HOOK_SO" ]; then
     adb push "$HOOK_SO" "${DEVICE_DIR}/libcam_hook.so"
     adb shell "su -c 'chmod 644 ${DEVICE_DIR}/libcam_hook.so'"
+fi
+
+# frame placement tool
+if [ -f "$FRAMEPLACE_BIN" ]; then
+    adb push "$FRAMEPLACE_BIN" "${DEVICE_DIR}/frameplace"
+    adb shell "su -c 'chmod 755 ${DEVICE_DIR}/frameplace'"
 fi
 
 # eBPF object

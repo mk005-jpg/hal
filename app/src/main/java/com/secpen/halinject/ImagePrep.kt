@@ -46,6 +46,26 @@ object ImagePrep {
         }
     }
 
+    /**
+     * Save a screenshot to use as a *placement reference*: the target app's
+     * camera screen (the oval/face guide or document outline) that the operator
+     * lines the injection frame up against.  Stored as reference.jpg in the
+     * inject dir and returned as a Bitmap for the on-screen overlay.
+     * Not consumed by the injection chain — it's an alignment aid only.
+     */
+    fun saveReference(ctx: Context, uri: Uri): Bitmap? {
+        return try {
+            val dir = File("/data/local/tmp/hal_inject").also { it.mkdirs() }
+            val ref = File(dir, "reference.jpg")
+            ctx.contentResolver.openInputStream(uri)?.use { src ->
+                FileOutputStream(ref).use { dst -> src.copyTo(dst) }
+            } ?: return null
+            BitmapFactory.decodeFile(ref.absolutePath)
+        } catch (e: Exception) {
+            null
+        }
+    }
+
     private fun writeNv21(bmp: Bitmap, out: File) {
         val w = bmp.width; val h = bmp.height
         val argb = IntArray(w * h)
